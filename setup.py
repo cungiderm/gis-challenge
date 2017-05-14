@@ -28,7 +28,7 @@ log_format = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)
 logger = logging.getLogger()
 logger.setLevel(log_level)
 
-file_handler = logging.FileHandler("{0}.log".format(log_path))
+file_handler = logging.FileHandler(log_path)
 file_handler.setFormatter(log_format)
 logger.addHandler(file_handler)
 
@@ -102,7 +102,7 @@ def load_csv(source_path, database_name, schema_name, table_name, fields, format
 
 def export_to_csv(destination_path, database_name, schema_name, table_name, format='csv', header='True', delimiter=',', quote='"'):
     run(['sudo', '-u', 'postgres', 'psql', '-d', database_name,
-         '-c', 'COPY {0}.{1} TO \'{2}\' WITH (FORMAT {3}, HEADER {4}, DELIMITER \'{5}\', QUOTE \'{6}\')'.format(schema_name, table_name, destination_path, format, header, delimiter, quote)])
+         '-c', 'COPY (SELECT * FROM {0}.{1}) TO \'{2}\' WITH (FORMAT {3}, HEADER {4}, DELIMITER \'{5}\', QUOTE \'{6}\')'.format(schema_name, table_name, destination_path, format, header, delimiter, quote)])
 
 
 def drop_column(database_name, schema_name, table_name, column_name):
@@ -121,7 +121,19 @@ def update_column(database_name, schema_name, table_name, column_name, query):
 
 
 def import_shapefile(source_path, database_name, schema_name, table_name):
-    run('shp2pgsql -s 4283 -d {0} {1}.{2} | sudo -u postgres psql -d {3}'.format(source_path, schema_name, table_name, database_name), True)
+    run('shp2pgsql -s 4283:4326 -d {0} {1}.{2} | sudo -u postgres psql -d {3}'.format(source_path, schema_name, table_name, database_name), True)
+
+
+def export_shapefile(destination_path, database_name, schema_name, table_name):
+    run('sudo -u postgres pgsql2shp -f {0} {1} {2}.{3}'.format(destination_path, database_name, schema_name, table_name), True)
+
+
+def export_geojson(source_path, destination_path):
+    run(['ogr2ogr', '-f', 'GeoJSON', destination_path, source_path])
+
+
+def export_mbtiles(source_path, destination_path):
+    run(['/usr/local/bin/tippecanoe', '-o', destination_path, source_path])
 
 
 def dump_database(database_name, dump_path):
@@ -182,6 +194,15 @@ def unpack_fields(table_definitions):
     return fields, field_specs
 
 
+def add_primary_key(database_name, schema_name, table_name, column_name, column_type, sequence_name):
+    run(['sudo', '-u', 'postgres', 'psql', '-d', database_name,
+         '-c', 'CREATE SEQUENCE {0}'.format(sequence_name)])
+    run(['sudo', '-u', 'postgres', 'psql', '-d', database_name,
+         '-c', 'ALTER TABLE {0}.{1} ADD {2} {3} NOT NULL DEFAULT nextval(\'{4}\')'.format(schema_name, table_name, column_name, column_type, sequence_name)])
+    run(['sudo', '-u', 'postgres', 'psql', '-d', database_name,
+         '-c', 'ALTER TABLE {0}.{1} ADD CONSTRAINT pk_{1} PRIMARY KEY ({2})'.format(schema_name, table_name, column_name)])
+
+
 def import_victorian_school_data(dataspecs_path, source_path, database_name, schema_name, table_name):
     logger.info('Start importing school data...')
     r = requests.get(dataspecs_path)
@@ -189,6 +210,7 @@ def import_victorian_school_data(dataspecs_path, source_path, database_name, sch
     fields, field_specs = unpack_fields(data['result']['fields'])
     create_table(database_name, schema_name, table_name, field_specs)
     load_csv(source_path, database_name, schema_name, table_name, fields)
+    add_primary_key(database_name, schema_name, table_name, 'id', 'int', 'school_id_seq')
     logger.info('Finish importing school data...')
 
 
@@ -214,23 +236,27 @@ def setup():
                                  os.path.join(configuration.get('data', 'staging_path') + os.path.basename(urlparse.urlparse(data_sources['victorian_school_data'])[2])),
                                  configuration.get('database', 'db_name'),
                                  'public', 'school')
-    drop_column(configuration.get('database', 'db_name'), 'public', 'locality', 'boundary')
-    add_column(configuration.get('database', 'db_name'), 'public', 'locality', 'boundary', 'geography')
     drop_column(configuration.get('database', 'db_name'), 'public', 'school', 'location')
-    add_column(configuration.get('database', 'db_name'), 'public', 'school', 'location', 'geography')
-    update_column(configuration.get('database', 'db_name'), 'public', 'locality', 'boundary', 'ST_GeogFromText(ST_AsText(ST_Transform(geom, 4326)))')
-    update_column(configuration.get('database', 'db_name'), 'public', 'school', 'location', 'ST_GeogFromText(ST_AsText(ST_Transform(ST_SetSRID(ST_MakePoint(x, y), 4283), 4326)))')
-    create_index(configuration.get('database', 'db_name'), 'public', 'locality', 'boundary', 'idx_locality_boundary', 'GIST')
+    add_column(configuration.get('database', 'db_name'), 'public', 'school', 'location', 'geometry(Point, 4326)')
+    update_column(configuration.get('database', 'db_name'), 'public', 'school', 'location', 'ST_Transform(ST_SetSRID(ST_MakePoint(x, y), 4283), 4326)')
+    create_index(configuration.get('database', 'db_name'), 'public', 'locality', 'geom', 'idx_locality_geom', 'GIST')
     create_index(configuration.get('database', 'db_name'), 'public', 'school', 'location', 'idx_school_location', 'GIST')
     execute_sql_file(configuration.get('database', 'db_name'), 'deliverables/schools_by_locality.sql')
-    export_to_csv(os.path.join(configuration.get('data', 'staging_path'), '/tmp/schools_by_locality.csv'), configuration.get('database', 'db_name'), 'public', 'schools_by_locality')
-    run(['sudo', 'rm', '-rf', os.path.join(configuration.get('data', 'deliverables_path'), 'schools_by_locality.csv')])
-    run(['sudo', 'cp', '/tmp/schools_by_locality.csv', os.path.join(configuration.get('data', 'deliverables_path'))])
-    run(['sudo', 'chown', 'williamlibrata:williamlibrata', os.path.join(configuration.get('data', 'deliverables_path'), 'schools_by_locality.csv')])
-    dump_database(configuration.get('database', 'db_name'), '/tmp/postgis_export.dmp')
-    run(['sudo', 'rm', '-rf', os.path.join(configuration.get('data', 'deliverables_path'), 'postgis_export.dmp')])
-    run(['sudo', 'cp', '/tmp/postgis_export.dmp', os.path.join(configuration.get('data', 'deliverables_path'))])
-    run(['sudo', 'chown', 'williamlibrata:williamlibrata', os.path.join(configuration.get('data', 'deliverables_path'), 'postgis_export.dmp')])
+    execute_sql_file(configuration.get('database', 'db_name'), 'sql/vw_locality.sql')
+    execute_sql_file(configuration.get('database', 'db_name'), 'sql/vw_school.sql')
+    run(['sudo', 'rm', '-rf', '/tmp/deliverables/'])
+    run(['sudo', 'mkdir', '/tmp/deliverables/'])
+    run(['sudo', 'chown', 'postgres:postgres', '/tmp/deliverables/'])
+    run(['sudo', 'chmod', '777', '/tmp/deliverables/'])
+    export_to_csv(os.path.join(configuration.get('data', 'staging_path'), '/tmp/deliverables/schools_by_locality.csv'), configuration.get('database', 'db_name'), 'public', 'schools_by_locality')
+    dump_database(configuration.get('database', 'db_name'), '/tmp/deliverables/postgis_export.dmp')
+    export_shapefile('/tmp/deliverables/locality.shp', configuration.get('database', 'db_name'), 'public', 'locality')
+    export_shapefile('/tmp/deliverables/school.shp', configuration.get('database', 'db_name'), 'public', 'school')
+    export_geojson('/tmp/deliverables/locality.shp', '/tmp/deliverables/locality.geojson')
+    export_geojson('/tmp/deliverables/school.shp', '/tmp/deliverables/school.geojson')
+    export_mbtiles('/tmp/deliverables/locality.geojson', '/tmp/deliverables/localities.mbtiles')
+    export_mbtiles('/tmp/deliverables/school.geojson', '/tmp/deliverables/schools.mbtiles')
+    run(['sudo', 'cp', '-rf', '/tmp/deliverables/*', configuration.get('data', 'deliverables_path')])
 
 
 if __name__ == '__main__':
