@@ -6,7 +6,7 @@ CREATE TABLE schools_by_locality AS
     FROM locality l
     INNER JOIN school s
         ON ST_Intersects(l.boundary, s.location) = True
-    GROUP BY lc_ply_pid, vic_loca_2;
+    GROUP BY lc_ply_pid, vic_loca_2
 );
 
 INSERT INTO schools_by_locality (locality_id, locality_name, schools)
